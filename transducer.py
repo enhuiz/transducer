@@ -1,24 +1,15 @@
 from __future__ import division
 
 import torch
+import torch.nn as nn
 from torch.autograd import Function
+
 import transducer_cpp
 
+
 class Transducer(Function):
-
-    def __init__(self, blank_label=None):
-        """
-        Constructor for Transducer cost.
-
-        Arguments:
-            blank_label (optional) (Int): Integer representing the index
-                of the blank, defaults to `alphabet_size - 1`.
-        """
-        super(Transducer, self).__init__()
-        self.blank_label = blank_label
-
     @staticmethod
-    def forward(ctx, log_probs, labels, lengths, label_lengths):
+    def forward(ctx, log_probs, labels, lengths, label_lengths, blank=None):
         """
         Computes the Transducer cost for a minibatch of examples.
 
@@ -26,7 +17,7 @@ class Transducer(Function):
             log_probs (FloatTensor): The log probabilities should
                 be of shape
                 (minibatch, input len, output len, vocab size).
-            labels (IntTensor): 1D tensor of labels for each example
+            labels (IntTensor): 2D tensor of labels for each example
                 consecutively.
             lengths (IntTensor): 1D tensor of number actviation time-steps
                 for each example.
@@ -44,13 +35,12 @@ class Transducer(Function):
         costs = torch.zeros(log_probs.shape[0])
         grads = log_probs.new(log_probs.shape).zero_()
 
-        blank_label = 0#self.blank_label
-        if blank_label is None:
-            blank_label = log_probs.shape[-1] - 1
+        if blank is None:
+            blank = log_probs.shape[-1] - 1
 
         transducer_cpp.transduce(log_probs, labels,
-                             lengths, label_lengths,
-                             costs, grads, blank_label)
+                                 lengths, label_lengths,
+                                 costs, grads, blank)
         if is_cuda:
             costs = costs.cuda()
             grads = grads.cuda()
@@ -60,39 +50,52 @@ class Transducer(Function):
 
     @staticmethod
     def backward(ctx, cost):
-        return ctx.saved_tensors[0], None, None, None
+        return ctx.saved_tensors[0], None, None, None, None
 
-class TransducerLoss(Transducer):
-    def __init__(self, size_average=True, blank_label=None):
-        super(TransducerLoss, self).__init__(blank_label)
-        self.size_average = size_average
 
-    def forward(self, *args):
-        parent = super(TransducerLoss, self)
-        costs = parent.forward(*args)
-        cost = torch.sum(costs)
-        if self.size_average:
-            cost = cost / costs.shape[0]
-        return costs.new((cost,))
+class TransducerLoss(nn.Module):
+    def __init__(self, blank=None, reduction='mean'):
+        super().__init__()
+        self.blank = blank
+        self.reduction = reduction
 
-    def backward(self, *args):
-        parent = super(TransducerLoss, self)
-        grads = parent.backward(*args)[0]
-        if self.size_average:
-            grads = grads / grads.shape[0]
-        return grads, None, None, None
+    def forward(self, log_probs, labels, lengths, label_lengths):
+        """
+        Args:
+            log_probs: (N, T, S, D)
+            labels: (N, L)
+            lengths: (N)
+            label_lengths: (N)
+        """
+        labels = [i for label, label_length in zip(labels, label_lengths)
+                  for i in label[:label_length]]
+        labels = torch.tensor(labels)
+        loss = Transducer.apply(log_probs,
+                                labels,
+                                lengths,
+                                label_lengths,
+                                self.blank)
+        if self.reduction == 'sum':
+            loss = loss / label_lengths
+        loss = loss.mean()
+
+        return loss
+
 
 def check_type(var, t, name):
     if var.dtype is not t:
         raise TypeError("{} must be {}".format(name, t))
 
+
 def check_contiguous(var, name):
     if not var.is_contiguous():
         raise ValueError("{} must be contiguous".format(name))
 
+
 def check_dim(var, dim, name):
     if len(var.shape) != dim:
         raise ValueError("{} must be {}D".format(name, dim))
+
 
 def certify_inputs(log_probs, labels, lengths, label_lengths):
     check_type(log_probs, torch.float32, "log_probs")
